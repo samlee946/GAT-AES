@@ -13,12 +13,29 @@ import torch_geometric
 
 from torch.utils.data import DataLoader
 from torch.utils.data.dataloader import default_collate
-from GNN import GNN, MultiNodeGNN, MultiNodeGNNForNVEmbed, GNNForNVEmbed
+from GNN import GNN, MultiNodeGNN, MultiNodeGNNForNVEmbed, GNNForNVEmbed, MultiNodeGCN, MultiNodeGNNWithPromptNodes
+import TraitAttention
+from BertBaseLine import BL
 from metrics import compute_metrics
 
 
 def main():
     parser = argparse.ArgumentParser(description='Process some integers.')
+    # parser.add_argument('--lm_lr', type=float, default=3e-5, help='lr for lm')
+    # parser.add_argument('--warmup_ratio', type=float, help='warmup ratio', default=0.1)
+    # parser.add_argument('--lds_sigma', type=int, default=2)
+    # parser.add_argument('--lds_ks', type=float, default=15)
+    # parser.add_argument('--disable_lora', action='store_true', help='disable lora')
+    # parser.add_argument('--disable_lm', action='store_true', help='disable lm')
+    # parser.add_argument('--aux_task_prompt_classification_ce', action='store_true', help='')
+    # parser.add_argument('--aux_task_prompt_classification_bce', action='store_true', help='')
+    # parser.add_argument('--aux_task_prompt_classification_weight', type=float, default=1)
+    # parser.add_argument('--log_dir', type=str, help='log directory', default='logs/')
+    # # accepts a list of hidden sizes
+    # parser.add_argument('--act_func', type=str, default='relu')
+    # parser.add_argument('--train_dev_partition_name', type=str, help='train dev partition name', default='asap_ridley')
+    # parser.add_argument('--enable_flash_attention', action='store_true', help='enable flash attention')
+    
 
     # Path related
     parser.add_argument('--cache_path', type=str, help='path to store preprocessed dataset', default=None)
@@ -27,14 +44,17 @@ def main():
     parser.add_argument('--asap_pp_path', type=str, help='path to asap plus plus', default='data/ASAP++/')
     parser.add_argument('--ridleys_readability_path', type=str, help='path to the rubrics', default='data/allreadability_updated.pickle')
     parser.add_argument('--ridleys_hand_crafted_path', type=str, help='path to the rubrics', default='data/hand_crafted_v3_normalized.csv')
-    parser.add_argument('--hand_crafted_feats_path', type=str, help='path to the rubrics', default='data/training_set_rel3_latin1_with_all_feats.csv')
+    parser.add_argument('--lis_feats_path', type=str, help='path to the rubrics', default='data/training_set_rel3_latin1_with_all_feats.csv')
+    parser.add_argument('--llm_feats_path', type=str, help='path to the rubrics', default='data/preprocessed_dataset_with_llm_merged_standardized.pkl')
     parser.add_argument('--folds_path', type=str, help='path to the folds', default='data/Taghipour_folds/')
     parser.add_argument('--output_path', type=str, help='path to store output', default='output/')
 
 
     # Features related
     parser.add_argument('--threshold', type=str, help='activation function', default=-1)
-    parser.add_argument('--use_ridleys_feats', action='store_true', help='use ridleys features')
+    parser.add_argument('--use_ridleys_feats', action='store_true', help='use ridleys features')    
+    parser.add_argument('--use_llm_features_llama', action='store_true', default=False)
+    parser.add_argument('--use_llm_features_gemma', action='store_true', default=False)
     parser.add_argument('--use_utos_feat', action='store_true', help='use pos features')
     parser.add_argument('--use_pos_features', action='store_true', help='use pos features')
     parser.add_argument('--use_top_n_words_feat', action='store_true', help='use sentence similarity features')
@@ -46,7 +66,7 @@ def main():
     # Logging related
     parser.add_argument('--wandb_project_name', type=str, help='wandb project name', default='AES-within-prompt')
     parser.add_argument('--run_name', type=str, default=None)
-
+    parser.add_argument('--disable_model_checkpoint', action='store_true', help='use essay features')
 
     # Hyperparameters
     parser.add_argument('--lm_model', type=str, help='pretrained language model', default='google-bert/bert-base-cased')
@@ -68,6 +88,11 @@ def main():
     parser.add_argument('--dim_reduction', type=int, default=-1)
     parser.add_argument('--apply_max_pooling', action='store_true', help='')
     parser.add_argument('--freeze_layers_num', type=int, default=-1)
+    parser.add_argument('--use_trait_att', action='store_true', help='')
+    parser.add_argument('--use_prompt_nodes', action='store_true', help='')
+    parser.add_argument('--run_bert_large_base_line', action='store_true', help='')
+    parser.add_argument('--run_t5_base_line', action='store_true', help='')
+    
 
     # GAT Hyperparameters
     parser.add_argument('--GNN_hidden_size', type=int, default=64)
@@ -75,8 +100,11 @@ def main():
     parser.add_argument('--GNN_num_layers', type=int, default=2)
     parser.add_argument('--GNN_num_emb_nodes', type=int, default=1)
     parser.add_argument('--GNN_num_feat_nodes', type=int, default=1)
+    parser.add_argument('--GNN_num_prompt_nodes', type=int, default=1)
     parser.add_argument('--GNN_dropout', type=float, default=0.1)
-    parser.add_argument('--GNN_edge_mode', type=str, default='all_pairs', choices=['all_pairs', 'none', 'arts_order'])
+    parser.add_argument('--GNN_edge_mode', type=str, default='all_pairs', choices=['all_pairs', 'none', 'arts_order', 'highly_correlated'])
+    parser.add_argument('--GNN_edge_correlation_threshold', type=float, default=0)
+    parser.add_argument('--GNN_layer_type', type=str, default='GAT', choices=['GAT', 'GCN', 'SAGE', 'GIN'])
 
 
     args = parser.parse_args()
@@ -150,10 +178,25 @@ def main():
 
     # define model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.GNN_num_feat_nodes > 1 or args.GNN_num_emb_nodes > 1:
-        model = MultiNodeGNN(args, encoded_prompts)
+    if args.run_bert_large_base_line:
+        model = BL(args, encoded_prompts)
+    elif args.use_trait_att:
+        model = TraitAttention.MultiNodeGNN(args, encoded_prompts)
+    elif args.use_prompt_nodes:
+        model = MultiNodeGNNWithPromptNodes(args, encoded_prompts)
+    elif args.GNN_num_feat_nodes > 1 or args.GNN_num_emb_nodes > 1 or args.GNN_layer_type != 'GAT':
+        if 'nvidia' in args.lm_model:
+            model = MultiNodeGNNForNVEmbed(args, encoded_prompts)
+        else:
+            if args.GNN_layer_type == 'GAT':
+                model = MultiNodeGNN(args, encoded_prompts)
+            else:
+                model = MultiNodeGCN(args, encoded_prompts)
     else:
-        model = GNN(args, encoded_prompts)
+        if 'nvidia' in args.lm_model:
+            model = GNNForNVEmbed(args, encoded_prompts)
+        else:
+            model = GNN(args, encoded_prompts)
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.task_lr)  # AdamW
 
@@ -167,6 +210,7 @@ def main():
     best_dev_metrics = None
     best_test_metrics = None
     best_epoch = -1
+    max_qwk_avg = -1
 
     # init random seed
     set_seed(args.seed)
@@ -174,6 +218,9 @@ def main():
     # train the model
     with tqdm.tqdm(total=args.epochs * len(train_loader), desc="Training", unit="batch") as pbar:
         for epoch in range(args.epochs):
+            
+            wandb_log_dict = {}
+
             for train_batch in train_loader:
 
                 train_batch = to_cuda(train_batch, device)
@@ -203,8 +250,14 @@ def main():
                 best_test_metrics = test_metrics
                 best_epoch = epoch
 
-                # save best model
-                torch.save(model.state_dict(), os.path.join(args.output_path, "best_model.pth"))
+                # every 10 epochs, log the best metrics
+                epoch_10 = (epoch + 10) // 10 * 10
+                wandb_log_dict[f"best_dev_qwk_avg_{epoch_10}"] = best_dev_metrics
+                wandb_log_dict[f"best_test_qwk_avg_{epoch_10}"] = best_test_metrics
+
+                # save best model 
+                if not args.disable_model_checkpoint:
+                    torch.save(model.state_dict(), os.path.join(args.output_path, "best_model.pth"))
 
             # save output to files
             with open(os.path.join(args.output_path, f"Output_{epoch}.pkl"), "wb") as f:
@@ -223,7 +276,6 @@ def main():
                     "test_losses": test_losses,
                 }, f)
 
-            wandb_log_dict = {}
             wandb_log_dict["dev_log/epoch"] = epoch
             wandb_log_dict["dev_log/loss"] = np.mean(dev_losses)
             wandb_log_dict["test_log/loss"] = np.mean(test_losses)
@@ -234,6 +286,8 @@ def main():
             wandb_log_dict["best_epoch"] = best_epoch
             wandb_log_dict["best_dev_qwk_avg"] = best_dev_metrics['qwk_avg']
             wandb_log_dict["best_test_qwk_avg"] = best_test_metrics['qwk_avg']
+            max_qwk_avg = max(max_qwk_avg, best_test_metrics['qwk_avg'])
+            wandb_log_dict["max_test_qwk_avg"] = max_qwk_avg
             wandb.log(wandb_log_dict)
             
             logger.info(f"""dev metrics: {dev_metrics}""")

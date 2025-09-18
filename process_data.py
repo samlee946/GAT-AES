@@ -192,10 +192,10 @@ def get_all_data(args):
     if args.use_utos_feat or args.use_pronoun_feat or args.use_pos_features or args.use_sim_feat or args.use_top_n_words_feat or args.use_at_tokens_feat:
         args.use_essay_feats = True
 
-        hand_crafted_feats_data = pd.read_csv(args.hand_crafted_feats_path)
-        hand_crafted_feats_data.set_index('essay_id', inplace=True)
+        lis_feats_data = pd.read_csv(args.lis_feats_path)
+        lis_feats_data.set_index('essay_id', inplace=True)
         # iterate the dataframe
-        for essay_id, row in hand_crafted_feats_data.iterrows():
+        for essay_id, row in lis_feats_data.iterrows():
             if essay_id not in asap_essays:
                 continue
             if args.use_utos_feat:
@@ -216,6 +216,25 @@ def get_all_data(args):
             if args.use_at_tokens_feat:
                 asap_essays[essay_id]['at_tokens_feat'] = ensure_list(row['at_tokens_feat'])
                 feature_groups.add('at_tokens_feat')
+
+    if args.use_llm_features_llama or args.use_llm_features_gemma:
+        args.use_essay_feats = True
+
+        with open(args.llm_feats_path, 'rb') as f:
+            llm_feats_data = pickle.load(f)
+            # convert to dataframe
+            llm_feats_data = pd.DataFrame(llm_feats_data)
+            llm_feats_data.set_index('essay_id', inplace=True)
+            # iterate the dataframe
+            for essay_id, row in llm_feats_data.iterrows():
+                if essay_id not in asap_essays:
+                    continue
+                if args.use_llm_features_llama:
+                    asap_essays[essay_id]['llm_features_llama'] = ensure_list(row['llm_features_llama'])
+                    feature_groups.add('llm_features_llama')
+                if args.use_llm_features_gemma:
+                    asap_essays[essay_id]['llm_features_gemma'] = ensure_list(row['llm_features_gemma'])
+                    feature_groups.add('llm_features_gemma')
 
     # drop essay 4355 from df_asap because it does not appear in ridley's folds
     if 4355 in asap_essays:
@@ -261,6 +280,10 @@ def get_partitions(args):
             feature_groups.add('top_n_words_feat')
         if args.use_at_tokens_feat:
             feature_groups.add('at_tokens_feat')
+        if args.use_llm_features_llama:
+            feature_groups.add('llm_features_llama')
+        if args.use_llm_features_gemma:
+            feature_groups.add('llm_features_gemma')
         if feature_groups:
             args.use_essay_feats = True
     else:
@@ -295,6 +318,25 @@ def get_partitions(args):
                 asap_essays[essay_id]['essay_feats'] = []
                 for feature_group in feature_groups:
                     asap_essays[essay_id]['essay_feats'].extend(essay[feature_group])
+
+    # all pair trait correlations
+    trait_correlations = {}
+    if args.GNN_edge_mode == 'highly_correlated':
+        score_vector_positions = get_score_vector_positions(args)
+        for i, trait1 in enumerate(args.traits_to_use):
+            for j, trait2 in enumerate(args.traits_to_use):
+                if i >= j:
+                    continue
+                arr1 = []
+                arr2 = []
+                for essay in train_data:
+                    if essay['labels'][score_vector_positions[trait1]] != -1 and essay['labels'][score_vector_positions[trait2]] != -1:
+                        arr1.append(essay['labels'][score_vector_positions[trait1]])
+                        arr2.append(essay['labels'][score_vector_positions[trait2]])
+                corr = np.corrcoef(arr1, arr2)[0][1]
+                trait_correlations[(trait1, trait2)] = corr
+        args.trait_correlations = trait_correlations
+
     return train_data, dev_data, test_data, asap_essays, asap_prompts, encoded_prompts, feature_groups
 
 def feature_selection(args, train_essays, feature_groups):
